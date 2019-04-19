@@ -513,6 +513,8 @@ namespace internal {
         inner_entries_t v[2];
         uint32_t consistent_id;
 
+        uint32_t order_stat[number_children_slots]; // statistics value to derive 99 th percentile, etc
+
         inner_entries_t* consistent() {
             assert( consistent_id < 2 );
             return v + consistent_id;
@@ -550,6 +552,9 @@ namespace internal {
             auto in_cbegin = std::next(src->consistent()->children, std::distance( src->begin(), first ));
             auto in_cend = std::next(in_cbegin, consistent()->_size + 1);
             auto o_clast = std::copy( in_cbegin, in_cend, consistent()->children );
+            // copy order_stat entries
+            std::copy(first,last,this->order_stat);
+
             assert(std::is_sorted(begin(), end()));
         }
 
@@ -586,6 +591,18 @@ namespace internal {
             auto out_children_end = std::copy( ++in_children_splitted, in_children_end, out_insert_pos );
             pop.flush( working_copy()->children, sizeof( working_copy()->children[0] )*std::distance(out_children_begin, out_children_end));
 
+
+            //update order-stats
+            auto in_orderstats_begin = this->order_stat;
+            auto in_orderstats_splitted = std::next( in_orderstats_begin, std::distance( this->begin(), partition_point ) );
+            int i;
+            for(i = orderstats_end; i > order_stats_splitted; i-- ){
+                this->order_stat[i+2] = this->order_stat[i];
+            }
+            ++i;
+            this->order_stat[i] = compute_stat(lnode);
+            this->order_stat[i+1] = compute_stat(rnode);
+
             switch_consistent( pop );
             assert( std::is_sorted( this->begin(), this->end() ) );
         }
@@ -593,6 +610,16 @@ namespace internal {
         const persistent_ptr<node_t>& get_child( const_reference key ) const {
             auto it = std::lower_bound( this->begin(), this->end(), key );
             return get_left_child(it);
+        }
+
+        const persistent_ptr<node_t>& get_child( long leaf_index ) const {
+            int i;
+            for(i = 0; i < this->size(); i++){ // finding the index that we should decent
+                if(this->order_stat[i] > leaf_index){
+                    leaf_index -= this->order_stat[i];
+                }
+            }
+            return get_left_child(this->begin() + i); // traverse this tree
         }
 
         const  persistent_ptr<node_t>& get_left_child(const_iterator it) const {
@@ -953,6 +980,23 @@ namespace internal {
             return leaf;
         }
 
+        /* find the leaf nodes corresponding to */
+		leaf_node_type* find_leaf_node( const long index, long& leaf_index) const {
+            if (root == nullptr)
+                return nullptr;
+
+            node_persistent_ptr node = root;
+            while (!node->leaf()) {
+                node = cast_inner( node )->get_child(leaf_index);
+            }
+            leaf_node_type* leaf = cast_leaf( node ).get();
+            leaf->check_consistency( epoch );
+            return leaf;
+        }
+
+
+
+
         // TODO: merge with previous method
         typedef std::vector<inner_node_persistent_ptr> path_type;
         leaf_node_persistent_ptr find_leaf_to_insert( const key_type& key, path_type& path ) const {
@@ -967,6 +1011,16 @@ namespace internal {
             leaf->check_consistency( epoch );
             return leaf;
         }
+
+        typedef std::vector<inner_node_persistent_ptr> path_type;
+        void update_order_stats( const key_type& key, path_type& path, path_type::iterator end ) const {
+            assert( root != nullptr );
+            node_persistent_ptr node = root;
+            for(auto i = path.begin(); i != end;i++){
+                (*i)->inc_stat( key );
+            }
+        }
+
 
         typename path_type::const_iterator find_full_node( const path_type& path ) {
             auto i = path.end() - 1;
@@ -1102,6 +1156,20 @@ namespace internal {
             return const_iterator( leaf, leaf_it );
         }
 
+        // we support indexOf operation
+        const_iterator find( const long index) const {
+            long leaf_idx; // the index in to the leaf if found
+            const leaf_node_type* leaf = find_leaf_node(index, leaf_idx);
+            if (leaf == nullptr) return end();
+
+            typename leaf_node_type::const_iterator leaf_it = leaf->begin() + leaf_idx;
+            if (leaf->end() == leaf_it) return end();
+
+            return const_iterator( leaf, leaf_it );
+        }
+
+
+
         size_t erase(const key_type& key) {
             leaf_node_type* leaf = find_leaf_node(key);
             if (leaf == nullptr) return size_t(0);
@@ -1227,7 +1295,13 @@ namespace internal {
 
         persistent_ptr<inner_node_type> inner_root = allocate_inner( pop, root, root->level() + 1, key, l_child, r_child );
     }
-    
+
+
+    /* In addition to updating the key value, we are going to update the order statistics.
+     * We have to do two passes for now. In better implementation, we could remember the
+     * internal node locations that needs to be updated
+     */
+
     template<typename TKey, typename TValue, size_t degree>
     std::pair<typename b_tree_base<TKey, TValue, degree>::iterator, bool> b_tree_base<TKey, TValue, degree>::insert_descend( pool_base& pop, const_reference entry ) {
         path_type path;
@@ -1238,6 +1312,7 @@ namespace internal {
         inner_node_type* parent_node = nullptr;
 
         if (leaf->full()) {
+            // no duplicate entries. Hence no order-statistics update
             typename leaf_node_type::iterator leaf_it = leaf->find( key );
             if (leaf_it != leaf->end()) { // Entry with the same key found
                 return std::pair<iterator, bool>( iterator( leaf, leaf_it ), false );
@@ -1257,6 +1332,7 @@ namespace internal {
             /**
              * If root is full. Split root
              */
+
             if (( *i )->full()) {
                 parent_node = nullptr;
                 split_inner_node( pop, *i, parent_node, left_child, right_child );
@@ -1264,6 +1340,10 @@ namespace internal {
             }
             else {
                 parent_node = (*i).get();
+                /*
+                 * update order-stats till (not inclusive) parent.
+                */
+                update_order_stats(key,--i);
             }
             ++i;
 
@@ -1278,6 +1358,9 @@ namespace internal {
         }
 
         std::pair<typename leaf_node_type::iterator, bool> ret = leaf->insert( pop, entry );
+        if(!path.empty()){
+            update_order_stats(key,path.end());
+        }
         return std::pair<iterator, bool>( iterator( leaf, ret.first ), ret.second );;
     }
 
