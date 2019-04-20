@@ -491,6 +491,7 @@ namespace internal {
     template <typename TKey, uint64_t number_entrys_slots>
     class inner_node_t : public node_t {
         typedef inner_node_t<TKey, number_entrys_slots> self_type;
+        const static size_t number_children_slots = number_entrys_slots + 1;
     public:
         typedef TKey key_type;
         typedef key_type value_type; // Inner node stores only keys
@@ -500,9 +501,9 @@ namespace internal {
         typedef const value_type* const_pointer;
         typedef node_iterator<self_type, false> iterator;
         typedef node_iterator<self_type, true> const_iterator;
-
+        uint32_t order_stat[number_children_slots]; // statistics value to derive 99 th percentile, etc
     private:
-        const static size_t number_children_slots = number_entrys_slots + 1;
+
 
         struct inner_entries_t {
             value_type entries[number_entrys_slots];
@@ -513,7 +514,6 @@ namespace internal {
         inner_entries_t v[2];
         uint32_t consistent_id;
 
-        uint32_t order_stat[number_children_slots]; // statistics value to derive 99 th percentile, etc
 
         inner_entries_t* consistent() {
             assert( consistent_id < 2 );
@@ -553,15 +553,19 @@ namespace internal {
             auto in_cend = std::next(in_cbegin, consistent()->_size + 1);
             auto o_clast = std::copy( in_cbegin, in_cend, consistent()->children );
             // copy order_stat entries
-            std::copy(first,last,this->order_stat);
-
+            unsigned int stat_begin = std::distance(src->begin(),first);
+            unsigned int stat_end = consistent()->size + 1;
+            for(unsigned int i = stat_begin; i <= stat_end; i++){
+                this->order_stat[i] = src->order_stat[i]; // order stat is a volatile state. Hence no
+            }
             assert(std::is_sorted(begin(), end()));
         }
 
         /**
          * Update splitted node with pair of new nodes
          */
-        void update_splitted_child( pool_base& pop, const_reference entry, persistent_ptr<node_t>& lnode, persistent_ptr<node_t>& rnode, const persistent_ptr<node_t>& splitted_node ) {
+        void update_splitted_child( pool_base& pop, const_reference entry, persistent_ptr<node_t>& lnode, persistent_ptr<node_t>& rnode,
+                                    unsigned long lstat,unsigned long rstat,const persistent_ptr<node_t>& splitted_node ) {
             assert( !full() );
             iterator partition_point = std::lower_bound( this->begin(), this->end(), entry );
 
@@ -593,15 +597,15 @@ namespace internal {
 
 
             //update order-stats
-            auto in_orderstats_begin = this->order_stat;
-            auto in_orderstats_splitted = std::next( in_orderstats_begin, std::distance( this->begin(), partition_point ) );
+            auto orderstats_splitted = std::distance( this->begin(), partition_point);
+            auto orderstats_end = consistent()->size +1;
             int i;
-            for(i = orderstats_end; i > order_stats_splitted; i-- ){
-                this->order_stat[i+2] = this->order_stat[i];
+            for(i = orderstats_end; i > orderstats_splitted; i-- ){
+                this->order_stat[i+2] = this->order_stat[i]; // make room for 2 children updates
             }
             ++i;
-            this->order_stat[i] = compute_stat(lnode);
-            this->order_stat[i+1] = compute_stat(rnode);
+            this->order_stat[i] = lstat;
+            this->order_stat[i+1] = rstat;
 
             switch_consistent( pop );
             assert( std::is_sorted( this->begin(), this->end() ) );
@@ -850,13 +854,28 @@ namespace internal {
             return middle;
         }
 
+        unsigned long compute_stat(persistent_ptr<node_t>& node){
+            unsigned int stat= 0;
+            if(node.get()->leaf()){
+                auto leaf_node = cast_leaf(node.get());
+                return leaf_node->size();
+            }
+            // inner node
+            auto inner_node = cast_inner(node.get());
+            for(unsigned int i = 0; i < inner_node->size();i++ ){
+                stat += inner_node->order_stat[i];
+            }
+            return stat;
+        }
+
         void split_inner_node( pool_base &pop, const node_persistent_ptr &src_node, inner_node_type* parent_node, node_persistent_ptr &left, node_persistent_ptr &right ) {
             assert( split_node == nullptr );
             assignment( pop, split_node, src_node );
             typename inner_node_type::const_iterator partition_point = split_half( pop, split_node, left, right );
             assert( partition_point != cast_inner( split_node )->end() );
             if (parent_node) {
-                parent_node->update_splitted_child( pop, *partition_point, left, right, split_node );
+                parent_node->update_splitted_child( pop, *partition_point, left, right,
+                                                    compute_stat(left),compute_stat(right), split_node );
             }
             else { // Root node is split
                 assert( root == split_node );
@@ -1012,10 +1031,11 @@ namespace internal {
             return leaf;
         }
 
-        typedef std::vector<inner_node_persistent_ptr> path_type;
-        void update_order_stats( const key_type& key, path_type& path, path_type::iterator end ) const {
+
+        void update_order_stats( const key_type& key, path_type& path,unsigned int distance ) const {
             assert( root != nullptr );
             node_persistent_ptr node = root;
+            auto end = std::next(path.begin(),distance);
             for(auto i = path.begin(); i != end;i++){
                 (*i)->inc_stat( key );
             }
@@ -1303,7 +1323,8 @@ namespace internal {
      */
 
     template<typename TKey, typename TValue, size_t degree>
-    std::pair<typename b_tree_base<TKey, TValue, degree>::iterator, bool> b_tree_base<TKey, TValue, degree>::insert_descend( pool_base& pop, const_reference entry ) {
+    std::pair<typename b_tree_base<TKey, TValue, degree>::iterator, bool> b_tree_base<TKey, TValue, degree>::
+    insert_descend( pool_base& pop, const_reference entry ) {
         path_type path;
         const key_type& key = entry.first;
 
@@ -1343,7 +1364,7 @@ namespace internal {
                 /*
                  * update order-stats till (not inclusive) parent.
                 */
-                update_order_stats(key,--i);
+                update_order_stats(key, path, std::distance(path.begin(),i));
             }
             ++i;
 
@@ -1359,7 +1380,7 @@ namespace internal {
 
         std::pair<typename leaf_node_type::iterator, bool> ret = leaf->insert( pop, entry );
         if(!path.empty()){
-            update_order_stats(key,path.end());
+            update_order_stats(key,path,std::distance(path.begin(),path.end()));
         }
         return std::pair<iterator, bool>( iterator( leaf, ret.first ), ret.second );;
     }
